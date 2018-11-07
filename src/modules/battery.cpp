@@ -50,6 +50,7 @@ void waybar::modules::Battery::worker()
   threadTimer_ = [this, interval] {
     thread_.sleep_for(chrono::seconds(interval));
     dp.emit();
+    update();
   };
   thread_ = [this] {
     struct inotify_event event = {0};
