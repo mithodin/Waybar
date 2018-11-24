@@ -1,7 +1,7 @@
 #include "modules/network.hpp"
 
 waybar::modules::Network::Network(const Json::Value& config)
-  : ALabel(config, "{ifname}"), family_(AF_INET),
+  : ALabel(config, "{ifname}", 60), family_(AF_INET),
     signal_strength_dbm_(0), signal_strength_(0)
 {
   sock_fd_ = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
@@ -26,6 +26,7 @@ waybar::modules::Network::Network(const Json::Value& config)
       char ifname[IF_NAMESIZE];
       if_indextoname(ifid_, ifname);
       ifname_ = ifname;
+      getInterfaceAddress();
     }
   }
   initNL80211();
@@ -33,11 +34,25 @@ waybar::modules::Network::Network(const Json::Value& config)
   // Trigger first values
   getInfo();
   update();
+  worker();
+}
+
+waybar::modules::Network::~Network()
+{
+  close(sock_fd_);
+  nl_socket_free(sk_);
+}
+
+void waybar::modules::Network::worker()
+{
   thread_ = [this] {
     char buf[4096];
-    uint64_t len = netlinkResponse(sock_fd_, buf, sizeof(buf),
-      RTMGRP_LINK | RTMGRP_IPV4_IFADDR);
+    auto len = netlinkResponse(sock_fd_, buf, sizeof(buf), RTMGRP_LINK | RTMGRP_IPV4_IFADDR);
+    if (len == 0) {
+      return;
+    }
     bool need_update = false;
+    bool new_addr = false;
     for (auto nh = reinterpret_cast<struct nlmsghdr *>(buf); NLMSG_OK(nh, len);
       nh = NLMSG_NEXT(nh, len)) {
       if (nh->nlmsg_type == NLMSG_DONE) {
@@ -45,6 +60,9 @@ waybar::modules::Network::Network(const Json::Value& config)
       }
       if (nh->nlmsg_type == NLMSG_ERROR) {
         continue;
+      }
+      if (nh->nlmsg_type == RTM_NEWADDR) {
+        new_addr = true;
       }
       if (nh->nlmsg_type < RTM_NEWADDR) {
         auto rtif = static_cast<struct ifinfomsg *>(NLMSG_DATA(nh));
@@ -57,27 +75,37 @@ waybar::modules::Network::Network(const Json::Value& config)
       }
     }
     if (ifid_ <= 0 && !config_["interface"].isString()) {
-      // Need to wait before get external interface
-      thread_.sleep_for(std::chrono::seconds(1));
-      ifid_ = getExternalInterface();
+      if (new_addr) {
+        // Need to wait before get external interface
+        while (ifid_ <= 0) {
+          ifid_ = getExternalInterface();
+          thread_.sleep_for(std::chrono::seconds(1));
+        }
+      } else {
+        ifid_ = getExternalInterface();
+      }
       if (ifid_ > 0) {
         char ifname[IF_NAMESIZE];
         if_indextoname(ifid_, ifname);
         ifname_ = ifname;
+        getInterfaceAddress();
         need_update = true;
       }
     }
     if (need_update) {
+      if (ifid_ > 0) {
+        getInfo();
+      }
+      dp.emit();
+    }
+  };
+  thread_timer_ = [this] {
+    thread_.sleep_for(interval_);
+    if (ifid_ > 0) {
       getInfo();
       dp.emit();
     }
   };
-}
-
-waybar::modules::Network::~Network()
-{
-  close(sock_fd_);
-  nl_socket_free(sk_);
 }
 
 auto waybar::modules::Network::update() -> void
@@ -97,11 +125,14 @@ auto waybar::modules::Network::update() -> void
     }
     label_.get_style_context()->remove_class("disconnected");
   }
-  label_.set_text(fmt::format(format,
+  label_.set_markup(fmt::format(format,
     fmt::arg("essid", essid_),
     fmt::arg("signaldBm", signal_strength_dbm_),
     fmt::arg("signalStrength", signal_strength_),
-    fmt::arg("ifname", ifname_)
+    fmt::arg("ifname", ifname_),
+    fmt::arg("netmask", netmask_),
+    fmt::arg("ipaddr", ipaddr_),
+    fmt::arg("cidr", cidr_)
   ));
 }
 
@@ -110,6 +141,9 @@ void waybar::modules::Network::disconnected()
   essid_.clear();
   signal_strength_dbm_ = 0;
   signal_strength_ = 0;
+  ipaddr_.clear();
+  netmask_.clear();
+  cidr_ = 0;
   ifname_.clear();
   ifid_ = -1;
 }
@@ -255,6 +289,36 @@ out:
   return ifidx;
 }
 
+void waybar::modules::Network::getInterfaceAddress() {
+  unsigned int cidrRaw;
+  struct ifaddrs *ifaddr, *ifa;
+  int success = getifaddrs(&ifaddr);
+  if (success == 0) {
+    ifa = ifaddr;
+    while (ifa != nullptr && ipaddr_.empty() && netmask_.empty()) {
+      if (ifa->ifa_addr != nullptr && ifa->ifa_addr->sa_family == family_) {
+        if (strcmp(ifa->ifa_name, ifname_.c_str()) == 0) {
+          ipaddr_ = inet_ntoa(((struct sockaddr_in*)ifa->ifa_addr)->sin_addr);
+          netmask_ = inet_ntoa(((struct sockaddr_in*)ifa->ifa_netmask)->sin_addr);
+          cidrRaw = ((struct sockaddr_in *)(ifa->ifa_netmask))->sin_addr.s_addr;
+          unsigned int cidr = 0;
+          while (cidrRaw) {
+              cidr += cidrRaw & 1;
+              cidrRaw >>= 1;
+          }
+          cidr_ = cidr;
+        }
+      }
+      ifa = ifa->ifa_next;
+    }
+    freeifaddrs(ifaddr);
+  } else {
+    ipaddr_.clear();
+    netmask_.clear();
+    cidr_ = 0;
+  }
+}
+
 int waybar::modules::Network::netlinkRequest(int fd, void *req,
   uint32_t reqlen, uint32_t groups)
 {
@@ -269,13 +333,12 @@ int waybar::modules::Network::netlinkRequest(int fd, void *req,
 int waybar::modules::Network::netlinkResponse(int fd, void *resp,
   uint32_t resplen, uint32_t groups)
 {
-  int ret;
   struct sockaddr_nl sa = {};
   sa.nl_family = AF_NETLINK;
   sa.nl_groups = groups;
   struct iovec iov = { resp, resplen };
   struct msghdr msg = { &sa, sizeof(sa), &iov, 1, nullptr, 0, 0 };
-  ret = recvmsg(fd, &msg, 0);
+  auto ret = recvmsg(fd, &msg, 0);
   if (msg.msg_flags & MSG_TRUNC) {
     return -1;
   }
@@ -370,7 +433,7 @@ auto waybar::modules::Network::getInfo() -> void
 {
   struct nl_msg* nl_msg = nlmsg_alloc();
   if (nl_msg == nullptr) {
-    nl_socket_free(sk_);
+    nlmsg_free(nl_msg);
     return;
   }
   if (genlmsg_put(nl_msg, NL_AUTO_PORT, NL_AUTO_SEQ, nl80211_id_, 0, NLM_F_DUMP,

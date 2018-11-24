@@ -1,4 +1,5 @@
 #include "client.hpp"
+#include <iostream>
 
 waybar::Client::Client(int argc, char* argv[])
   : gtk_app(Gtk::Application::create(argc, argv, "fr.arouillard.waybar")),
@@ -40,7 +41,10 @@ waybar::Client::Client(int argc, char* argv[])
     "/etc/xdg/waybar/style.css",
     "./resources/style.css",
   });
-
+  if (css_file.empty() || config_file.empty()) {
+    throw std::runtime_error("Missing required resources files");
+  }
+  std::cout << "Resources files: " + config_file + ", " + css_file << std::endl;
 }
 
 void waybar::Client::handleGlobal(void *data, struct wl_registry *registry,
@@ -88,6 +92,10 @@ void waybar::Client::bindInterfaces()
     .global_remove = handleGlobalRemove,
   };
   wl_registry_add_listener(registry, &registry_listener, this);
+  wl_display_roundtrip(wl_display);
+  if (!layer_shell || !seat || !xdg_output_manager) {
+    throw std::runtime_error("Failed to acquire required resources.");
+  }
   wl_display_roundtrip(wl_display);
 }
 
